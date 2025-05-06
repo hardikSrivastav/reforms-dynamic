@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_BASE_URL=http://localhost:8000/api
+    volumes:
+      - .:/app
+      - /app/node_modules
+      - /app/.next
+    # Enable turbopack
+    command: npm run dev 
