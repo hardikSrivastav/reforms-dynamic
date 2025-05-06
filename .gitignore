@@ -1,0 +1,24 @@
+# .gitignore
+# Environment files
+.env
+*.env
+.env.local
+.env.development
+.env.production
+
+# Virtual environment
+venv/
+ENV/
+
+# IDE files
+.vscode/
+.idea/
+
+# Logs and databases
+*.log
+*.sqlite
+
+# Dependency directories
+node_modules/
+__pycache__/
+*.pyc
