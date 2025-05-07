@@ -4,6 +4,7 @@ from app.core.scoring import get_confidence_threshold
 from app.db.postgres import get_db_conn
 from app.db.redis import get_cache, set_cache
 import json
+import random
 
 async def get_metric_details(metric_id: str) -> Optional[Dict[str, Any]]:
     """Get details for a specific metric.
@@ -350,25 +351,48 @@ def get_preferred_question_type(metric_id: str) -> str:
     Returns:
         Preferred question type
     """
-    # This is a placeholder - in a real implementation, this would be stored in the metric
-    # metadata or learned from interaction patterns
+    # This now heavily prioritizes interactive question types over free text
+    # to increase variety and engagement
     
     # Simple mapping based on metric naming conventions
     metric_id_lower = metric_id.lower()
     
-    if "satisfaction" in metric_id_lower or "rating" in metric_id_lower:
+    # First check for specific patterns in metric IDs
+    if "satisfaction" in metric_id_lower or "rating" in metric_id_lower or "recommend" in metric_id_lower:
         return "likert"
     elif "frequency" in metric_id_lower or "often" in metric_id_lower:
         return "multiple_choice"
-    elif "amount" in metric_id_lower or "count" in metric_id_lower:
+    elif "amount" in metric_id_lower or "count" in metric_id_lower or "number" in metric_id_lower:
         return "number"
-    elif "interest" in metric_id_lower or "preference" in metric_id_lower:
-        return "text"
-    elif "aware" in metric_id_lower or "heard" in metric_id_lower:
+    elif "choice" in metric_id_lower or "preference" in metric_id_lower or "select" in metric_id_lower:
+        return "multiple_choice"
+    elif "aware" in metric_id_lower or "heard" in metric_id_lower or "know" in metric_id_lower:
         return "boolean"
+    elif "range" in metric_id_lower or "scale" in metric_id_lower or "between" in metric_id_lower:
+        return "range"
     
-    # Default to open text
-    return "text"
+    # If no specific match, use a weighted random selection to ensure variety
+    # Strongly favor interactive types over text (80% chance of non-text type)
+    question_types = [
+        ("multiple_choice", 35),  # 35% chance
+        ("likert", 20),           # 20% chance
+        ("boolean", 15),          # 15% chance
+        ("range", 10),            # 10% chance
+        ("text", 20)              # Only 20% chance for free text
+    ]
+    
+    # Use weighted random selection
+    total_weight = sum(weight for _, weight in question_types)
+    rand_val = random.uniform(0, total_weight)
+    
+    cumulative_weight = 0
+    for q_type, weight in question_types:
+        cumulative_weight += weight
+        if rand_val <= cumulative_weight:
+            return q_type
+    
+    # Fallback (should never reach here)
+    return "multiple_choice"
 
 def get_unresolved_metrics_names(session_state: Dict[str, Any]) -> List[str]:
     """Get names of metrics that still need assessment.

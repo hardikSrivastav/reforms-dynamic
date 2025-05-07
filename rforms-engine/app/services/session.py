@@ -10,6 +10,12 @@ from app.services.llm import llm_question_selection, get_fallback_question, quer
 from app.core.metrics import prioritize_metrics_for_questioning, is_metric_complete
 from app.core.config import settings
 from app.core.advanced_questioning import advanced_question_engine, process_question_feedback
+from app.core.question_types import (
+    get_preferred_question_type, 
+    create_question_from_llm_response,
+    enhance_question_with_type,
+    QUESTION_TYPES
+)
 import json
 import uuid
 import time
@@ -233,7 +239,12 @@ async def get_next_question(session_id: str) -> Dict[str, Any]:
             # Get the highest priority pending metric
             highest_priority_metric = _get_highest_priority_pending_metric(session_state)
             
+            # Generate a question with appropriate type
             llm_question = await generate_fallback_question(highest_priority_metric, session_state)
+            
+            # Ensure it has type-specific fields
+            if "type" in llm_question and llm_question["type"] != "text":
+                llm_question = enhance_question_with_type(llm_question)
             
             # Log performance
             elapsed = time.time() - start_time
@@ -345,12 +356,18 @@ async def get_next_question(session_id: str) -> Dict[str, Any]:
         if metrics_pending:
             metric_id = metrics_pending[0]
             
+            # Get preferred question type for this metric
+            preferred_type = get_preferred_question_type(metric_id)
+            
             fallback_question = {
                 "question_id": f"fallback_{int(time.time())}",
                 "question_text": f"Please tell me about your experience with {metric_id.replace('_', ' ')}.",
                 "metric_id": metric_id,
-                "type": "text"
+                "type": preferred_type
             }
+            
+            # Enhance with type-specific fields
+            fallback_question = enhance_question_with_type(fallback_question)
             
             # Save question to session history
             await _save_question_to_history(session_id, fallback_question, selection_method="emergency_fallback")
@@ -394,6 +411,40 @@ def _normalize_question_fields(question: Dict[str, Any]) -> None:
         if frontend_field in question and backend_field not in question:
             question[backend_field] = question[frontend_field]
     
+    # Ensure question type is properly mapped from backend to frontend
+    if "type" in question:
+        # Ensure we're using the frontend type name from QUESTION_TYPES mapping
+        backend_type = question["type"]
+        
+        # Check if this is a backend type that needs mapping
+        if backend_type in QUESTION_TYPES:
+            question["type"] = QUESTION_TYPES[backend_type]
+        
+        # Handle old-style naming that might still use backend names
+        if backend_type == "select":
+            question["type"] = "multiple_choice"
+        
+        logger.debug(f"Mapped question type from '{backend_type}' to '{question['type']}'")
+    
+    # Ensure type-specific fields are present
+    question_type = question.get("type", "text")
+    
+    # For multiple_choice and multiselect types, ensure options are present
+    if question_type in ["multiple_choice", "select", "multiselect"] and "options" not in question:
+        # Add default options
+        question["options"] = [
+            {"value": "option1", "label": "Option 1"},
+            {"value": "option2", "label": "Option 2"},
+            {"value": "option3", "label": "Option 3"}
+        ]
+    
+    # For range type, ensure min_value and max_value are present
+    if question_type == "range":
+        if "min_value" not in question:
+            question["min_value"] = 0
+        if "max_value" not in question:
+            question["max_value"] = 100
+    
     # Log the normalized question for debugging
     logger.debug(f"Normalized question fields: {question}")
 
@@ -431,6 +482,13 @@ async def generate_fallback_question(metric_id: str, session_state: Dict[str, An
     Returns:
         Generated question
     """
+    # Import question types utilities
+    from app.core.question_types import (
+        get_preferred_question_type, 
+        create_question_from_llm_response,
+        QUESTION_TYPES
+    )
+    
     start_time = time.time()
     session_id = session_state.get("session_id", "unknown")
     
@@ -575,6 +633,58 @@ Metrics Needing Assessment: {', '.join(session_state.get('metrics_pending', []))
         context_prep_time = time.time() - context_start_time
         logger.debug(f"Context preparation took {context_prep_time:.3f}s")
         
+        # Get the preferred question type for this metric
+        preferred_type = get_preferred_question_type(metric_id)
+        
+        # Add instructions for question types
+        question_types_instructions = """
+QUESTION TYPES AVAILABLE:
+You can generate different types of questions. Specify the question type by including <type>TYPE</type> in your response.
+IMPORTANT: VARY YOUR QUESTION TYPES! Do not repeatedly use the same question type.
+
+Available types (use ALL of these throughout the survey):
+1. multiple_choice: Single choice from options (include <options> with each option on a new line)
+2. multiselect: Multiple choices from options (include <options> with each option on a new line)
+3. likert: Rating scale from 1-5
+4. boolean: Yes/No response
+5. range: Slider for range of values
+6. text: Free text response (use occasionally for detailed feedback)
+7. number: Numeric input
+8. date: Date picker
+9. email: Email input
+10. phone: Phone number input
+11. location: Location input
+
+YOUR GOAL is to create a varied and engaging survey. DO NOT default to the same type repeatedly.
+If you've recently generated a range question, choose a completely different type like multiple_choice or boolean.
+Consider the specific information you need and select the MOST APPROPRIATE type for gathering that information.
+
+EXAMPLE WITH OPTIONS:
+<type>multiple_choice</type>
+Which aspect of our fellowship program do you find most appealing?
+<options>
+Networking opportunities
+Learning curriculum
+Mentorship
+Project-based work
+Career advancement 
+</options>
+
+EXAMPLE WITH LIKERT:
+<type>likert</type>
+How satisfied are you with the application process for our fellowship program on a scale from 1-5?
+
+EXAMPLE WITH BOOLEAN:
+<type>boolean</type>
+Have you previously applied to similar fellowship programs?
+
+EXAMPLE WITH RANGE:
+<type>range</type>
+On a scale from 1 to 10, how confident are you in your ability to complete all program requirements?
+
+The system tends to default to range questions too often. Please prioritize using multiple_choice, likert, and boolean questions which provide better structure and data quality than range questions.
+"""
+        
         # Create the enhanced prompt with all the pieces
         prompt = f"""
 You are an expert survey designer tasked with generating a highly effective question to collect maximum data in minimum time.
@@ -591,6 +701,8 @@ METRIC PROGRESS: Confidence {current_confidence:.2f}/1.0, Questions {questions_a
 
 {raw_history}
 
+{question_types_instructions}
+
 IMPORTANT INSTRUCTION ON REFERENCING PREVIOUS RESPONSES:
 {'Based on the conversation history, the user has NOT yet provided any substantial information. DO NOT refer to specific details the user has shared, as they have not shared any.' if not has_meaningful_responses else conversation_summary}
 
@@ -599,6 +711,8 @@ Your task is to generate ONE effective question that:
 2. {'DOES NOT REFERENCE specific user details, as no substantial information has been shared yet' if not has_meaningful_responses else 'BUILDS ON VERIFIED USER RESPONSES listed above - do not reference information the user has not explicitly shared'}
 3. Is CONVERSATIONAL and ENGAGING - natural and easy to answer
 4. Is EFFICIENT - designed to maximize information gain with minimal questions
+5. Uses the appropriate QUESTION TYPE for this kind of information (specify with <type>TYPE</type>)
+6. If using options, includes clear and comprehensive OPTIONS (specify with <options>...)
 
 {'FIRST-TIME QUESTION EXAMPLES (since user has not provided substantial responses):' if not has_meaningful_responses else 'FOLLOW-UP QUESTION EXAMPLES:'}
 BAD EXAMPLE: {'"Tell me more about the code integrator you mentioned"' if not has_meaningful_responses else '"You mentioned liking our interface, can you elaborate?"'} (Don't reference details the user hasn't explicitly shared)
@@ -650,16 +764,12 @@ QUESTION:
             
             return fallback_result
         
-        # Extract just the question text and clean up
-        question_text = response.strip()
-        
-        # Format the response
-        result = {
-            "question_id": f"llm_{int(time.time())}",
-            "question_text": question_text,
-            "metric_id": metric_id,
-            "type": "text"
-        }
+        # Parse the LLM response into a structured question
+        result = create_question_from_llm_response(
+            llm_response=response.strip(),
+            metric_id=metric_id,
+            source="llm"
+        )
         
         # Cache the result with a short TTL (5 minutes)
         await redis.set(cache_key, json.dumps(result), ex=300)
@@ -671,12 +781,18 @@ QUESTION:
     except Exception as e:
         logger.error(f"Error generating fallback question: {str(e)}")
         # Return a very simple fallback
+        preferred_type = get_preferred_question_type(metric_id)
+        
+        # Create a basic question with the preferred type
         fallback = {
             "question_id": f"fallback_{int(time.time())}",
             "question_text": f"Can you share your thoughts about {metric_id.replace('_', ' ')}?",
             "metric_id": metric_id,
-            "type": "text"
+            "type": preferred_type
         }
+        
+        # Enhance with type-specific fields
+        fallback = enhance_question_with_type(fallback)
         
         total_time = time.time() - start_time
         logger.info(f"Generated emergency fallback in {total_time:.3f}s after error")

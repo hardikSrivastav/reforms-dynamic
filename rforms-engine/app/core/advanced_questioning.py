@@ -7,6 +7,7 @@ import re  # Add import for regular expressions
 import asyncio  # For parallel operations
 import time  # For performance tracking
 import hashlib
+import random
 
 # Import database clients
 from app.db.qdrant import get_qdrant_client
@@ -163,13 +164,7 @@ async def advanced_question_engine(session_state: Dict[str, Any]) -> Dict[str, A
         
         # List of truly generic question patterns that should be avoided
         # Only detect obvious boilerplate patterns, not legitimate follow-up questions
-        generic_patterns = [
-            r"^tell me more about",
-            r"^(can|could) you (please )?(tell|share|explain)",
-            r"^how (do|would) you feel about",
-            r"^what (are|is) your thoughts on",
-            r"^(please )?(share|tell me) your (thoughts|opinion|perspective)"
-        ]
+        generic_patterns = []
         
         logger.debug(f"[ADV_ENGINE] Using {len(generic_patterns)} patterns to detect generic questions")
         
@@ -466,29 +461,103 @@ async def advanced_question_engine(session_state: Dict[str, Any]) -> Dict[str, A
         # If a question was already returned in the process above, it would have returned
         # This is the fallback path
         metric_id = get_highest_priority_metric(session_state)
-        topic = metric_id.replace('_', ' ')
         
-        fallback_questions = [
-            f"Can you share more about your experience with {topic}?",
-            f"What aspects of {topic} are most important to you?",
-            f"How would you describe your ideal {topic} experience?",
-            f"What specific challenges have you faced regarding {topic}?",
-            f"What improvements would you suggest for {topic}?"
-        ]
+        # Check if metric_id is a UUID and try to get a more user-friendly name
+        import uuid
+        try:
+            is_uuid = bool(uuid.UUID(metric_id, version=4))
+        except ValueError:
+            is_uuid = False
+            
+        if is_uuid:
+            # Try to get a friendly name from session metadata if available
+            friendly_name = "your experience"
+            metric_metadata = session_state.get("survey_context", {}).get("metrics_metadata", {})
+            
+            if metric_id in metric_metadata:
+                friendly_name = metric_metadata[metric_id].get("name", "your experience")
+            
+            topic = friendly_name
+        else:
+            topic = metric_id.replace('_', ' ')
         
-        import random
-        fallback_index = random.randint(0, len(fallback_questions)-1)
-        fallback_text = fallback_questions[fallback_index]
+        # Get preferred question type for this metric
+        preferred_type = get_preferred_question_type(metric_id)
         
-        logger.info(f"[ADV_ENGINE] Using emergency fallback question ({fallback_index+1}/{len(fallback_questions)})")
-        fallback_question = {
-            "question_id": f"adv_{int(datetime.now().timestamp())}",
-            "question_text": fallback_text,
-            "metric_id": metric_id,
-            "type": "text",
-            "source": "fallback",
-            "selection_method": "emergency_fallback"
-        }
+        # Use a rotating fallback based on timestamp to ensure variety
+        # time is already imported at the top of the file, no need to reimport
+        
+        current_time = int(time.time())
+        fallback_type = current_time % 5  # 0-4 rotation
+        
+        # Override preferred type to ensure variety
+        if fallback_type == 0:
+            preferred_type = "multiple_choice"
+        elif fallback_type == 1:
+            preferred_type = "likert"
+        elif fallback_type == 2:
+            preferred_type = "boolean"
+        elif fallback_type == 3:
+            preferred_type = "range"
+        else:
+            preferred_type = "text"
+        
+        # Include different types of fallback questions based on preferred type
+        if preferred_type == "multiple_choice":
+            fallback_question = {
+                "question_id": f"adv_{int(datetime.now().timestamp())}",
+                "question_text": f"Which aspect of {topic} is most important to you?",
+                "metric_id": metric_id,
+                "type": "multiple_choice",
+                "source": "fallback",
+                "selection_method": "emergency_fallback",
+                "options": [
+                    {"value": "quality", "label": "Quality of service/product"},
+                    {"value": "convenience", "label": "Convenience/ease of use"},
+                    {"value": "cost", "label": "Cost effectiveness"},
+                    {"value": "support", "label": "Customer support"},
+                    {"value": "other", "label": "Other aspects"}
+                ]
+            }
+        elif preferred_type == "likert":
+            fallback_question = {
+                "question_id": f"adv_{int(datetime.now().timestamp())}",
+                "question_text": f"How would you rate your satisfaction with {topic} on a scale of 1-5?",
+                "metric_id": metric_id,
+                "type": "likert",
+                "source": "fallback",
+                "selection_method": "emergency_fallback"
+            }
+        elif preferred_type == "boolean":
+            fallback_question = {
+                "question_id": f"adv_{int(datetime.now().timestamp())}",
+                "question_text": f"Have you had a positive experience with {topic}?",
+                "metric_id": metric_id,
+                "type": "boolean",
+                "source": "fallback",
+                "selection_method": "emergency_fallback"
+            }
+        elif preferred_type == "range":
+            fallback_question = {
+                "question_id": f"adv_{int(datetime.now().timestamp())}",
+                "question_text": f"On a scale from 1 to 10, how would you rate your experience with {topic}?",
+                "metric_id": metric_id,
+                "type": "range",
+                "source": "fallback",
+                "selection_method": "emergency_fallback",
+                "min_value": 1,
+                "max_value": 10
+            }
+        else:
+            # Default text fallback as a last resort
+            fallback_question = {
+                "question_id": f"adv_{int(datetime.now().timestamp())}",
+                "question_text": f"What aspects of {topic} are most important to you?",
+                "metric_id": metric_id,
+                "type": "text",
+                "source": "fallback",
+                "selection_method": "emergency_fallback"
+            }
         
         logger.debug(f"[ADV_ENGINE] Emergency fallback question: {fallback_question}")
         return fallback_question
@@ -496,14 +565,99 @@ async def advanced_question_engine(session_state: Dict[str, Any]) -> Dict[str, A
         logger.error(f"[ADV_ENGINE] Error in advanced question engine: {str(e)}")
         # Emergency fallback
         metric_id = get_highest_priority_metric(session_state)
-        emergency_question = {
-            "question_id": f"adv_{int(datetime.now().timestamp())}",
-            "question_text": f"What's most important to you about {metric_id.replace('_', ' ')}?",
-            "metric_id": metric_id,
-            "type": "text",
-            "source": "fallback",
-            "selection_method": "error_fallback"
-        }
+        
+        # Use a rotating fallback based on timestamp to ensure variety
+        # time is already imported at the top of the file, no need to reimport
+        
+        current_time = int(time.time())
+        error_fallback_type = (current_time // 10) % 5  # Different rotation than the regular fallback
+        
+        # Select a question type based on the rotation
+        if error_fallback_type == 0:
+            preferred_type = "multiple_choice"
+        elif error_fallback_type == 1:
+            preferred_type = "likert"
+        elif error_fallback_type == 2:
+            preferred_type = "boolean" 
+        elif error_fallback_type == 3:
+            preferred_type = "range"
+        else:
+            preferred_type = "text"
+            
+        # Check if metric_id is a UUID and try to get a more user-friendly name
+        import uuid
+        try:
+            is_uuid = bool(uuid.UUID(metric_id, version=4))
+        except ValueError:
+            is_uuid = False
+            
+        if is_uuid:
+            # Try to get a friendly name from session metadata if available
+            friendly_name = "your experience"
+            metric_metadata = session_state.get("survey_context", {}).get("metrics_metadata", {})
+            
+            if metric_id in metric_metadata:
+                friendly_name = metric_metadata[metric_id].get("name", "your experience")
+            
+            topic = friendly_name
+        else:
+            topic = metric_id.replace('_', ' ')
+        
+        if preferred_type == "multiple_choice":
+            emergency_question = {
+                "question_id": f"adv_error_{int(datetime.now().timestamp())}",
+                "question_text": f"Which of these best describes your thoughts about {topic}?",
+                "metric_id": metric_id,
+                "type": "multiple_choice",
+                "source": "fallback",
+                "selection_method": "error_fallback",
+                "options": [
+                    {"value": "very_positive", "label": "Very positive"},
+                    {"value": "somewhat_positive", "label": "Somewhat positive"},
+                    {"value": "neutral", "label": "Neutral"},
+                    {"value": "somewhat_negative", "label": "Somewhat negative"},
+                    {"value": "very_negative", "label": "Very negative"}
+                ]
+            }
+        elif preferred_type == "likert":
+            emergency_question = {
+                "question_id": f"adv_error_{int(datetime.now().timestamp())}",
+                "question_text": f"How important is {topic} to you on a scale of 1-5?",
+                "metric_id": metric_id,
+                "type": "likert",
+                "source": "fallback",
+                "selection_method": "error_fallback"
+            }
+        elif preferred_type == "boolean":
+            emergency_question = {
+                "question_id": f"adv_error_{int(datetime.now().timestamp())}",
+                "question_text": f"Is {topic} important to you?",
+                "metric_id": metric_id,
+                "type": "boolean",
+                "source": "fallback",
+                "selection_method": "error_fallback"
+            }
+        elif preferred_type == "range":
+            emergency_question = {
+                "question_id": f"adv_error_{int(datetime.now().timestamp())}",
+                "question_text": f"On a scale from 1 to 10, how important is {topic} to you?",
+                "metric_id": metric_id,
+                "type": "range",
+                "source": "fallback",
+                "selection_method": "error_fallback",
+                "min_value": 1,
+                "max_value": 10
+            }
+        else:
+            emergency_question = {
+                "question_id": f"adv_error_{int(datetime.now().timestamp())}",
+                "question_text": f"What's most important to you about {topic}?",
+                "metric_id": metric_id,
+                "type": "text",
+                "source": "fallback",
+                "selection_method": "error_fallback"
+            }
+            
         logger.debug(f"[ADV_ENGINE] Error fallback question: {emergency_question}")
         return emergency_question
 
@@ -723,21 +877,33 @@ def format_question_from_vector(payload: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         A formatted question
     """
+    # Import question type utilities
+    from app.core.question_types import enhance_question_with_type, QUESTION_TYPES
+    
     # Generate a valid question_id if not present
     question_id = payload.get("question_id")
     if not question_id:
         question_id = f"vector_{int(datetime.now().timestamp())}"
     
-    # Ensure question type is valid
+    # Get the question type, defaulting to text
     question_type = payload.get("question_type", "text")
     
-    return {
+    # Create the base question
+    question = {
         "question_text": payload.get("question_text", ""),
         "metric_id": payload.get("metric_id", ""),
         "question_id": question_id,
         "source": "vector_db",
-        "type": question_type
+        "type": QUESTION_TYPES.get(question_type, question_type)
     }
+    
+    # Copy any type-specific fields from the payload
+    for field in ["options", "min_value", "max_value", "placeholder"]:
+        if field in payload:
+            question[field] = payload[field]
+    
+    # Ensure the question has all required fields for its type
+    return enhance_question_with_type(question, question_type)
 
 async def get_survey_context(session_state: Dict[str, Any]) -> str:
     """Get formatted survey context for LLM prompts.
@@ -1015,6 +1181,13 @@ async def llm_question_with_examples(
     Returns:
         Generated question
     """
+    # Import question types utilities
+    from app.core.question_types import (
+        get_preferred_question_type, 
+        create_question_from_llm_response,
+        QUESTION_TYPES
+    )
+    
     session_id = session_state.get("session_id", "unknown")
     logger.info(f"[LLM_QUESTION] Generating question for metric '{metric_id}' in session {session_id}")
     logger.debug(f"[LLM_QUESTION] Strategy: {strategy.get('recommended_approach')}, Examples: {len(examples)}")
@@ -1044,6 +1217,7 @@ async def llm_question_with_examples(
         f"EXAMPLE {i+1}:\n"
         f"Context: {e.get('context', 'No context')}\n"
         f"Question: {e.get('question_text', 'No question')}\n"
+        f"Type: {e.get('question_type', 'text')}\n"
         f"Success Rate: {e.get('success_rate', 'Unknown')}"
         for i, e in enumerate(examples)
     ])
@@ -1108,6 +1282,57 @@ async def llm_question_with_examples(
     
     logger.debug(f"[LLM_QUESTION] Metric progress: confidence={current_confidence:.2f}, questions={questions_asked}/{max_questions}")
     
+    # Get the preferred question type for this metric
+    preferred_type = get_preferred_question_type(metric_id)
+    
+    # Add instructions for question types
+    question_types_instructions = f"""
+QUESTION TYPES AVAILABLE:
+You can generate different types of questions. Specify the question type by including <type>TYPE</type> in your response.
+IMPORTANT: VARY YOUR QUESTION TYPES! Do not repeatedly use the same question type.
+
+Available types (use ALL of these throughout the survey):
+1. multiple_choice: Single choice from options (include <options> with each option on a new line)
+2. multiselect: Multiple choices from options (include <options> with each option on a new line)
+3. likert: Rating scale from 1-5
+4. boolean: Yes/No response
+5. range: Slider for range of values
+6. text: Free text response (use ONLY when other question types are not appropriate)
+7. number: Numeric input
+
+QUESTION TYPE INSTRUCTIONS:
+- You MUST include the question type tag: <type>chosen_type</type>
+- If the question history shows recent text questions, DO NOT use text type again
+- If using multiple_choice or multiselect, you MUST include <options> tags with at least 3-5 options
+- For range questions, specify the scale (e.g., "On a scale from 1-10")
+
+EXAMPLE WITH OPTIONS:
+<type>multiple_choice</type>
+Which aspect of our fellowship program do you find most appealing?
+<options>
+Networking opportunities
+Learning curriculum
+Mentorship
+Project-based work
+Career advancement 
+</options>
+
+EXAMPLE WITH LIKERT:
+<type>likert</type>
+How satisfied are you with the application process for our fellowship program on a scale from 1-5?
+
+EXAMPLE WITH BOOLEAN:
+<type>boolean</type>
+Have you previously applied to similar fellowship programs?
+
+EXAMPLE WITH RANGE:
+<type>range</type>
+On a scale from 1 to 10, how confident are you in your ability to complete all program requirements?
+
+IMPORTANT: You should strongly prefer structured question types (multiple_choice, likert, boolean) over open-ended text questions.
+Open text questions should be used sparingly (less than 20% of the time).
+"""
+    
     # Create prompt with enhanced context and more specific instructions
     prompt = f"""
 You are an expert survey designer tasked with generating a highly effective question to collect maximum data in minimum time.
@@ -1128,6 +1353,8 @@ METRICS INSIGHTS:
 
 {previous_questions_text}{avoid_text}
 
+{question_types_instructions}
+
 STRATEGY RATIONALE:
 {strategy.get('rationale', 'Generate the best question to assess the target metric')}
 
@@ -1142,6 +1369,8 @@ Your question should be:
 4. CONVERSATIONAL - natural and engaging, as if asked by a skilled interviewer
 5. FRESH - not repetitive of previous questions, NEVER ask a question similar to those listed in PREVIOUSLY ASKED QUESTIONS
 6. EFFICIENT - designed to maximize information gain with minimal questions
+7. Uses the appropriate QUESTION TYPE for this kind of information (specify with <type>TYPE</type>)
+8. If using options, includes clear and comprehensive OPTIONS (specify with <options>...</options>)
 
 BAD EXAMPLE: "How would you describe your {metric_name}?"
 GOOD EXAMPLE: "You mentioned dealing with [specific issue] during [specific time]. How did that impact your ability to [specific activity related to metric]?"
@@ -1186,9 +1415,9 @@ QUESTION:
                 start_time = time.time()
                 question_text = await query_llm(
                     prompt=prompt, 
-                    max_tokens=150,  # Allow for longer, more detailed questions
+                    max_tokens=500,  # Increased tokens to allow for type tags and options
                     model=model,
-                    system_prompt="You are an expert survey designer creating questions to collect maximum data in minimum time."
+                    system_prompt="You are an expert survey designer creating questions to collect maximum data in minimum time. You should strongly prefer structured question types over open-ended text questions."
                 )
                 elapsed = time.time() - start_time
                 
@@ -1209,9 +1438,9 @@ QUESTION:
                 start_time = time.time()
                 question_text = await query_llm(
                     prompt=prompt, 
-                    max_tokens=150,  # Allow for longer, more detailed questions
+                    max_tokens=500,  # Increased tokens to allow for type tags and options
                     model=model,
-                    system_prompt="You are an expert survey designer creating questions to collect maximum data in minimum time."
+                    system_prompt="You are an expert survey designer creating questions to collect maximum data in minimum time. You should strongly prefer structured question types over open-ended text questions."
                 )
                 elapsed = time.time() - start_time
                 
@@ -1242,20 +1471,21 @@ QUESTION:
             logger.info(f"[LLM_QUESTION] Returning LLM failure fallback question")
             return fallback
         
-        # Generate a valid question ID
-        question_id = f"llm_{int(datetime.now().timestamp())}"
+        # Parse the LLM response into a structured question
+        result = create_question_from_llm_response(
+            llm_response=question_text.strip(),
+            metric_id=metric_id,
+            source="llm_with_examples"
+        )
         
-        # Format the response
-        result = {
-            "question_text": question_text.strip(),
-            "metric_id": metric_id,
-            "question_id": question_id,
-            "source": "llm_with_examples",
-            "strategy": strategy.get("recommended_approach"),
-            "type": "text"
-        }
+        # Add strategy information
+        result["strategy"] = strategy.get("recommended_approach")
         
         logger.info(f"[LLM_QUESTION] Successfully generated question: '{result['question_text'][:50]}...'")
+        logger.debug(f"[LLM_QUESTION] Question type: {result.get('type', 'text')}")
+        if "options" in result:
+            logger.debug(f"[LLM_QUESTION] Options: {result['options']}")
+            
         return result
     except Exception as e:
         logger.error(f"[LLM_QUESTION] Error generating question with LLM: {str(e)}")
@@ -1294,7 +1524,7 @@ async def store_new_question_pattern(
         if not session_id and "session_state" in question:
             session_id = question.get("session_state", {}).get("session_id", "")
         
-        # Prepare payload
+        # Prepare payload with type information
         payload = {
             "question_id": question.get("question_id", f"gen_{int(datetime.now().timestamp())}"),
             "question_text": question["question_text"],
@@ -1308,6 +1538,11 @@ async def store_new_question_pattern(
             "effectiveness_history": [],
             "session_id": session_id  # Add session_id to track origin
         }
+        
+        # Include type-specific fields if present
+        for field in ["options", "min_value", "max_value", "placeholder"]:
+            if field in question:
+                payload[field] = question[field]
         
         # Store in vector database - QdrantClient methods are synchronous, don't use await
         client.upsert(
@@ -1420,7 +1655,7 @@ async def store_successful_question(
         # Generate a valid UUID for the point ID
         point_id = str(uuid.uuid4())
         
-        # Prepare payload
+        # Prepare payload with type information
         payload = {
             "question_id": question.get("question_id", f"gen_{int(datetime.now().timestamp())}"),
             "question_text": question.get("question_text", ""),
@@ -1433,6 +1668,11 @@ async def store_successful_question(
             "generated_by": "llm",
             "effectiveness_history": [effectiveness]
         }
+        
+        # Include type-specific fields if present
+        for field in ["options", "min_value", "max_value", "placeholder"]:
+            if field in question:
+                payload[field] = question[field]
         
         # Store in vector database - QdrantClient methods are synchronous, don't use await
         client.upsert(
@@ -1465,7 +1705,8 @@ def format_conversation_history(session_state: Dict[str, Any]) -> str:
     formatted = []
     
     for item in history:
-        formatted.append(f"Q: {item.get('text', '')}")
+        question_type = item.get("question", {}).get("type", "text") if "question" in item else "text"
+        formatted.append(f"Q ({question_type}): {item.get('text', '')}")
         formatted.append(f"A: {item.get('response_text', '')}")
     
     return "\n".join(formatted)
@@ -1486,7 +1727,8 @@ def format_recent_conversation(session_state: Dict[str, Any], max_turns: int = 3
     
     formatted = []
     for item in recent:
-        formatted.append(f"Q: {item.get('text', '')}")
+        question_type = item.get("question", {}).get("type", "text") if "question" in item else "text"
+        formatted.append(f"Q ({question_type}): {item.get('text', '')}")
         formatted.append(f"A: {item.get('response_text', '')}")
     
     return "\n".join(formatted)
@@ -1749,26 +1991,89 @@ def summarize_conversation(session_state: Dict[str, Any]) -> str:
     # Group by metrics
     metric_conversations = {}
     
+    # Track question types used
+    question_type_counts = {
+        "text": 0,
+        "multiple_choice": 0,
+        "likert": 0,
+        "boolean": 0,
+        "range": 0,
+        "number": 0,
+        "multiselect": 0,
+        "other": 0
+    }
+    
+    # Get survey context to lookup metric names
+    survey_context = session_state.get("survey_context", {})
+    metrics_metadata = survey_context.get("metrics_metadata", {})
+    
+    # Keep track of questions already seen to avoid duplication
+    seen_questions = set()
+    
     for item in history:
+        # Count question types
+        question_type = item.get("question", {}).get("type", "text") if "question" in item else "text"
+        if question_type in question_type_counts:
+            question_type_counts[question_type] += 1
+        else:
+            question_type_counts["other"] += 1
+            
         metric_id = item.get("metric_id", "general")
         
-        if metric_id not in metric_conversations:
-            metric_conversations[metric_id] = []
+        # Get human-readable metric name from metadata
+        if metric_id in metrics_metadata:
+            metric_name = metrics_metadata[metric_id].get("name", metric_id)
+        else:
+            # Fallback to a more readable format if name not found
+            metric_name = metric_id.replace("_", " ").title()
+        
+        if metric_name not in metric_conversations:
+            metric_conversations[metric_name] = []
+        
+        question_text = item.get("text", "")
+        response_text = item.get("response_text", "")
+        
+        # Skip if we've already seen this question or no response was given
+        if not question_text or not response_text or question_text in seen_questions:
+            continue
             
-        metric_conversations[metric_id].append({
-            "question": item.get("text", ""),
-            "response": item.get("response_text", "")
+        seen_questions.add(question_text)
+            
+        metric_conversations[metric_name].append({
+            "question": question_text,
+            "response": response_text,
+            "type": question_type
         })
     
     # Create summary for each metric
-    for metric_id, conversations in metric_conversations.items():
-        metric_summary = f"About {metric_id.replace('_', ' ')}:"
+    for metric_name, conversations in metric_conversations.items():
+        if not conversations:  # Skip metrics with no actual conversations
+            continue
+            
+        metric_summary = f"About {metric_name}:"
         
         for convo in conversations:
-            summary = f"When asked '{convo['question']}', user responded: '{convo['response'][:100]}...'"
+            # Truncate long question/response texts
+            question = convo['question'][:80] + "..." if len(convo['question']) > 80 else convo['question']
+            response = convo['response'][:80] + "..." if len(convo['response']) > 80 else convo['response']
+            question_type = convo.get('type', 'text')
+            
+            summary = f"When asked '{question}' ({question_type}), user responded: '{response}'"
             metric_summary += f"\n- {summary}"
             
         summary_parts.append(metric_summary)
+    
+    # Add question type statistics
+    question_type_stats = "QUESTION TYPE USAGE:\n"
+    total_questions = sum(question_type_counts.values())
+    
+    for q_type, count in question_type_counts.items():
+        if count > 0:
+            percentage = (count / total_questions) * 100 if total_questions > 0 else 0
+            question_type_stats += f"- {q_type}: {count} ({percentage:.1f}%)\n"
+    
+    # Include the statistics at the top for visibility
+    summary_parts.insert(0, question_type_stats)
     
     return "\n\n".join(summary_parts)
 
@@ -2054,8 +2359,7 @@ async def perform_vector_search(session_vector, session_state):
 async def deterministic_strategy(session_state, vector_examples, asked_questions):
     """Determine questioning strategy based on question count.
     
-    For sessions with <10 questions, always use custom_generation.
-    For sessions with ≥10 questions, always use reuse_past_pattern (vector search).
+    Rotates between different question types to ensure variety.
     
     Args:
         session_state: Current session state
@@ -2069,38 +2373,30 @@ async def deterministic_strategy(session_state, vector_examples, asked_questions
     history_len = len(session_state.get("question_history", []))
     target_metric = get_highest_priority_metric(session_state)
     
-    # Deterministic decision based on question count
-    '''
-    if history_len < 10:
-        # For early questions, always use custom generation
-        strategy = {
-            "recommended_approach": "custom_generation",
-            "target_metric": target_metric,
-            "specific_focus": "general experience",
-            "question_format": "open-ended",
-            "rationale": "Deterministic strategy - early in session (<10 questions), using custom generation"
-        }
-        logger.info(f"[DETERMINISTIC] Question count {history_len} < 10: Using custom_generation")
-    else:
-        # For later questions, always use vector search
-        strategy = {
-            "recommended_approach": "reuse_past_pattern",
-            "target_metric": target_metric,
-            "specific_focus": "prior successes",
-            "question_format": "proven patterns",
-            "rationale": "Deterministic strategy - later in session (≥10 questions), using vector patterns"
-        }
-        logger.info(f"[DETERMINISTIC] Question count {history_len} >= 10: Using reuse_past_pattern")
-    '''
-
+    # Use a rotating question format based on history length to ensure variety
+    # This ensures we don't get stuck with the same question type repeatedly
+    question_formats = ["multiple_choice", "likert", "boolean", "range", "text"]
+    format_index = history_len % len(question_formats)
+    selected_format = question_formats[format_index]
+    
+    # Different focuses for different question types
+    focuses = {
+        "multiple_choice": "preferences and priorities",
+        "likert": "satisfaction and agreement levels",
+        "boolean": "yes/no decisions and experiences",
+        "range": "degree and intensity of experiences",
+        "text": "specific details and context"
+    }
+    
     strategy = {
-            "recommended_approach": "custom_generation",
-            "target_metric": target_metric,
-            "specific_focus": "general experience",
-            "question_format": "open-ended",
-            "rationale": "Deterministic strategy - early in session (<10 questions), using custom generation"
-        }
-    logger.info(f"[DETERMINISTIC] Using custom_generation")
+        "recommended_approach": "custom_generation",
+        "target_metric": target_metric,
+        "specific_focus": focuses.get(selected_format, "general experience"),
+        "question_format": selected_format,
+        "rationale": f"Using {selected_format} question type to gather {focuses.get(selected_format, 'information')} about {target_metric.replace('_', ' ')}"
+    }
+    
+    logger.info(f"[DETERMINISTIC] Using {selected_format} question format (rotation based on history length {history_len})")
     
     return strategy
 
